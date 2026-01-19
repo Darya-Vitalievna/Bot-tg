@@ -1,0 +1,13 @@
+TELEGRAM_BOT_TOKEN = "8210404148:AAEkmlM3MI-GozvkNXncTZvmM3F4VNz2fkA"
+GEMINI_API_KEY = "AIzaSyCUBXSrQSfEkHSN6s-c4pg0d-VkGhema5U"
+GEMINI_MODEL = "gemini-2.0-flash"
+
+DB_PATH_HELP = "help_feature.sqlite3"
+
+ADMIN_USER_IDS = {
+    1966417024,
+    593855503,
+}	
+
+ADMIN_IDS = list(ADMIN_USER_IDS)
+
