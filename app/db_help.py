@@ -1,4 +1,4 @@
-# DB_HELP_FIXED_STATUS_2026_01_15
+# DB_HELP_COMPAT_MIGR_2026_01_19
 import sqlite3
 import datetime
 from pathlib import Path
@@ -10,23 +10,15 @@ ALL_GUILD_IDS = [1, 2, 3, 4, 5]
 
 
 def _resolve_db_path() -> str:
-    """
-    Приводим DB_PATH_HELP к абсолютному пути.
-    Если DB_PATH_HELP относительный, считаем от корня проекта BookBot (папка над app/).
-    """
     p = Path(DB_PATH_HELP)
     if p.is_absolute():
         return str(p)
-
-    project_root = Path(__file__).resolve().parent.parent  # .../BookBot
+    project_root = Path(__file__).resolve().parent.parent
     return str((project_root / p).resolve())
 
 
 def _connect() -> sqlite3.Connection:
-    path = _resolve_db_path()
-    # Чтобы ты сразу видела, какую БД реально использует бот (важно для проблемы "удалил экспертов, но они всё равно эксперты")
-    print(f"[DB_HELP] Using DB: {path}")
-    conn = sqlite3.connect(path)
+    conn = sqlite3.connect(_resolve_db_path())
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -60,11 +52,10 @@ def is_admin(user_id: int) -> bool:
 def is_expert(user_id: int) -> bool:
     conn = _connect()
     cur = conn.cursor()
-    try:
-        cur.execute("SELECT 1 FROM experts WHERE user_id=? LIMIT 1", (int(user_id),))
-        return cur.fetchone() is not None
-    finally:
-        conn.close()
+    cur.execute("SELECT 1 FROM experts WHERE user_id=? LIMIT 1", (int(user_id),))
+    ok = cur.fetchone() is not None
+    conn.close()
+    return ok
 
 
 def expert_guilds(user_id: int) -> List[int]:
@@ -85,16 +76,12 @@ def init_help_db() -> None:
     cur.execute("""
     CREATE TABLE IF NOT EXISTS experts (
         user_id INTEGER PRIMARY KEY,
-        username TEXT,
-        full_name TEXT,
         added_at TEXT,
         added_by INTEGER
     )
     """)
     _add_column(cur, "experts", "username", "TEXT")
     _add_column(cur, "experts", "full_name", "TEXT")
-    _add_column(cur, "experts", "added_at", "TEXT")
-    _add_column(cur, "experts", "added_by", "INTEGER")
 
     # help_requests
     if not _table_exists(cur, "help_requests"):
@@ -120,25 +107,28 @@ def init_help_db() -> None:
         _add_column(cur, "help_requests", "problem_since", "TEXT")
         _add_column(cur, "help_requests", "tried_actions", "TEXT")
         _add_column(cur, "help_requests", "desired_result", "TEXT")
-        # ВАЖНО: status (у тебя он уже есть как NOT NULL, поэтому insert обязан его заполнять)
         _add_column(cur, "help_requests", "status", "TEXT DEFAULT 'active'")
         _add_column(cur, "help_requests", "is_closed", "INTEGER DEFAULT 0")
         _add_column(cur, "help_requests", "is_deleted", "INTEGER DEFAULT 0")
         _add_column(cur, "help_requests", "created_at", "TEXT")
 
+        # если status уже был NOT NULL без default — это ок, мы будем всегда вставлять status
+        # старые строки с NULL статусом: подстрахуемся
+        try:
+            cur.execute("UPDATE help_requests SET status='active' WHERE status IS NULL")
+        except Exception:
+            pass
+
     # help_answers
     cur.execute("""
     CREATE TABLE IF NOT EXISTS help_answers (
         answer_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        request_id INTEGER,
-        expert_user_id INTEGER,
-        answer_text TEXT,
-        created_at TEXT,
-        expert_username TEXT,
-        expert_full_name TEXT
+        request_id INTEGER NOT NULL,
+        expert_user_id INTEGER NOT NULL,
+        answer_text TEXT NOT NULL,
+        created_at TEXT NOT NULL
     )
     """)
-    _add_column(cur, "help_answers", "created_at", "TEXT")
     _add_column(cur, "help_answers", "expert_username", "TEXT")
     _add_column(cur, "help_answers", "expert_full_name", "TEXT")
 
@@ -155,23 +145,24 @@ def init_help_db() -> None:
     )
     """)
 
-    # индексы
+    # Индексы
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_open ON help_requests(is_closed, is_deleted, created_at)")
+    except Exception:
+        pass
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_answers_req ON help_answers(request_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_answers_expert ON help_answers(expert_user_id)")
     except Exception:
         pass
-
-    # уникальность ответа: один эксперт - один ответ на запрос (если в базе уже есть дубли, индекс не создастся, это ок)
     try:
-        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_answers_req_expert ON help_answers(request_id, expert_user_id)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_apps_status ON expert_applications(status, created_at)")
     except Exception:
         pass
 
+    # UNIQUE(request_id, expert_user_id) — чтобы один эксперт отвечал один раз
     try:
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_user ON help_requests(student_user_id, created_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_open ON help_requests(is_closed, created_at)")
-        cur.execute("CREATE INDEX IF NOT EXISTS idx_requests_deleted ON help_requests(is_deleted, is_closed, created_at)")
+        cur.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_answers_req_expert ON help_answers(request_id, expert_user_id)")
     except Exception:
         pass
 
@@ -181,19 +172,23 @@ def init_help_db() -> None:
 
 # ----------------- experts management -----------------
 
-def add_expert(
-    user_id: int,
-    added_by: Optional[int] = None,
-    username: Optional[str] = None,
-    full_name: Optional[str] = None
-) -> Tuple[bool, str]:
+def add_expert(user_id: int, added_by: Optional[int] = None,
+              username: Optional[str] = None, full_name: Optional[str] = None) -> Tuple[bool, str]:
     conn = _connect()
     cur = conn.cursor()
     try:
-        cur.execute(
-            "INSERT INTO experts(user_id, username, full_name, added_at, added_by) VALUES (?, ?, ?, ?, ?)",
-            (int(user_id), username, full_name, _now(), int(added_by) if added_by is not None else None),
-        )
+        if _has_column(cur, "experts", "username") and _has_column(cur, "experts", "full_name"):
+            cur.execute(
+                "INSERT INTO experts(user_id, added_at, added_by, username, full_name) VALUES (?, ?, ?, ?, ?)",
+                (int(user_id), _now(), int(added_by) if added_by is not None else None,
+                 (username or "").lstrip("@") if username else None,
+                 full_name),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO experts(user_id, added_at, added_by) VALUES (?, ?, ?)",
+                (int(user_id), _now(), int(added_by) if added_by is not None else None),
+            )
         conn.commit()
         return True, "OK"
     except sqlite3.IntegrityError:
@@ -212,10 +207,13 @@ def remove_expert(user_id: int) -> bool:
     return changed
 
 
-def list_experts() -> List[Dict[str, Any]]:
+def list_experts(guild_id: Optional[int] = None) -> List[Dict[str, Any]]:
     conn = _connect()
     cur = conn.cursor()
-    cur.execute("SELECT user_id, username, full_name, added_at, added_by FROM experts ORDER BY user_id ASC")
+    if _has_column(cur, "experts", "username") and _has_column(cur, "experts", "full_name"):
+        cur.execute("SELECT user_id, username, full_name, added_at, added_by FROM experts ORDER BY user_id ASC")
+    else:
+        cur.execute("SELECT user_id, added_at, added_by FROM experts ORDER BY user_id ASC")
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -227,22 +225,28 @@ def create_help_request(user_id: int, guild_id: int, essence: str, since: str, t
     conn = _connect()
     cur = conn.cursor()
 
-    # КРИТИЧНО: если в таблице есть status (а у тебя он NOT NULL), заполняем его всегда
     has_status = _has_column(cur, "help_requests", "status")
+    has_deleted = _has_column(cur, "help_requests", "is_deleted")
 
-    if has_status:
+    if has_status and has_deleted:
         cur.execute("""
             INSERT INTO help_requests
             (student_user_id, guild_id, problem_essence, problem_since, tried_actions, desired_result,
              status, is_closed, is_deleted, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
         """, (int(user_id), int(guild_id), essence, since, tried, result, "active", _now()))
-    else:
+    elif has_status:
         cur.execute("""
             INSERT INTO help_requests
             (student_user_id, guild_id, problem_essence, problem_since, tried_actions, desired_result,
-             is_closed, is_deleted, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, 0, 0, ?)
+             status, is_closed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+        """, (int(user_id), int(guild_id), essence, since, tried, result, "active", _now()))
+    else:
+        cur.execute("""
+            INSERT INTO help_requests
+            (student_user_id, guild_id, problem_essence, problem_since, tried_actions, desired_result, is_closed, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?)
         """, (int(user_id), int(guild_id), essence, since, tried, result, _now()))
 
     conn.commit()
@@ -279,22 +283,38 @@ def list_user_requests(user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
 def list_open_requests(limit: int = 20) -> List[Dict[str, Any]]:
     conn = _connect()
     cur = conn.cursor()
-
-    where = "COALESCE(r.is_closed, 0) = 0"
-    if _has_column(cur, "help_requests", "is_deleted"):
-        where += " AND COALESCE(r.is_deleted, 0) = 0"
-
-    cur.execute(f"""
-        SELECT r.*,
-               (SELECT COUNT(*) FROM help_answers a WHERE a.request_id = r.request_id) AS answers_count
-        FROM help_requests r
-        WHERE {where}
-        ORDER BY COALESCE(r.created_at, '') DESC, r.request_id DESC
-        LIMIT ?
-    """, (int(limit),))
+    has_deleted = _has_column(cur, "help_requests", "is_deleted")
+    if has_deleted:
+        cur.execute("""
+            SELECT r.*,
+                   (SELECT COUNT(*) FROM help_answers a WHERE a.request_id = r.request_id) AS answers_count
+            FROM help_requests r
+            WHERE COALESCE(r.is_closed, 0) = 0
+              AND COALESCE(r.is_deleted, 0) = 0
+            ORDER BY COALESCE(r.created_at, '') DESC, r.request_id DESC
+            LIMIT ?
+        """, (int(limit),))
+    else:
+        cur.execute("""
+            SELECT r.*,
+                   (SELECT COUNT(*) FROM help_answers a WHERE a.request_id = r.request_id) AS answers_count
+            FROM help_requests r
+            WHERE COALESCE(r.is_closed, 0) = 0
+            ORDER BY COALESCE(r.created_at, '') DESC, r.request_id DESC
+            LIMIT ?
+        """, (int(limit),))
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def is_request_closed(request_id: int) -> bool:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("SELECT COALESCE(is_closed,0) AS c FROM help_requests WHERE request_id=? LIMIT 1", (int(request_id),))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and int(row["c"]) == 1)
 
 
 def close_request(request_id: int, user_id: Optional[int] = None) -> bool:
@@ -340,56 +360,192 @@ def close_request(request_id: int, user_id: Optional[int] = None) -> bool:
     return changed
 
 
-def is_request_closed(request_id: int) -> bool:
+def mark_request_deleted(request_id: int) -> bool:
     conn = _connect()
     cur = conn.cursor()
-    cur.execute("SELECT COALESCE(is_closed,0) AS is_closed FROM help_requests WHERE request_id=?", (int(request_id),))
-    row = cur.fetchone()
+    if not _has_column(cur, "help_requests", "is_deleted"):
+        conn.close()
+        return False
+    cur.execute("UPDATE help_requests SET is_deleted=1 WHERE request_id=?", (int(request_id),))
+    ok = cur.rowcount > 0
+    conn.commit()
     conn.close()
-    if not row:
-        return True
-    return int(row["is_closed"]) == 1
+    return ok
 
 
 # ----------------- answers -----------------
 
-def try_save_answer(
-    expert_user_id: int,
-    request_id: int,
-    answer_text: str,
-    expert_username: Optional[str] = None,
-    expert_full_name: Optional[str] = None
-) -> bool:
-    txt = (answer_text or "").strip()
-    if not txt:
-        return False
+def list_answers_for_request(request_id: int) -> List[Dict[str, Any]]:
+    conn = _connect()
+    cur = conn.cursor()
+    if _has_column(cur, "help_answers", "expert_username") and _has_column(cur, "help_answers", "expert_full_name"):
+        cur.execute("""
+            SELECT answer_id, request_id, expert_user_id, answer_text, created_at, expert_username, expert_full_name
+            FROM help_answers
+            WHERE request_id=?
+            ORDER BY created_at ASC, answer_id ASC
+        """, (int(request_id),))
+    else:
+        cur.execute("""
+            SELECT answer_id, request_id, expert_user_id, answer_text, created_at
+            FROM help_answers
+            WHERE request_id=?
+            ORDER BY created_at ASC, answer_id ASC
+        """, (int(request_id),))
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def try_save_answer(expert_user_id: int, request_id: int, answer_text: str,
+                    expert_username: Optional[str] = None, expert_full_name: Optional[str] = None) -> bool:
     if is_request_closed(request_id):
         return False
 
     conn = _connect()
     cur = conn.cursor()
+
     try:
-        cur.execute("""
-            INSERT INTO help_answers(request_id, expert_user_id, answer_text, created_at, expert_username, expert_full_name)
-            VALUES (?, ?, ?, ?, ?, ?)
-        """, (int(request_id), int(expert_user_id), txt, _now(), expert_username, expert_full_name))
+        if _has_column(cur, "help_answers", "expert_username") and _has_column(cur, "help_answers", "expert_full_name"):
+            cur.execute("""
+                INSERT INTO help_answers(request_id, expert_user_id, answer_text, created_at, expert_username, expert_full_name)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (int(request_id), int(expert_user_id), answer_text, _now(),
+                  (expert_username or "").lstrip("@") if expert_username else None,
+                  expert_full_name))
+        else:
+            cur.execute("""
+                INSERT INTO help_answers(request_id, expert_user_id, answer_text, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (int(request_id), int(expert_user_id), answer_text, _now()))
+
         conn.commit()
         return True
     except sqlite3.IntegrityError:
-        # UNIQUE(request_id, expert_user_id) => повторный ответ запрещён
+        # UNIQUE(request_id, expert_user_id) — второй ответ запрещён
         return False
     finally:
         conn.close()
 
 
-def list_answers_for_request(request_id: int) -> List[Dict[str, Any]]:
+# совместимость (если где-то зовут add_answer)
+def add_answer(request_id: int, expert_user_id: int, answer_text: str) -> bool:
+    return try_save_answer(expert_user_id, request_id, answer_text)
+
+
+# ----------------- expert applications -----------------
+
+def get_pending_application(user_id: int) -> Optional[Dict[str, Any]]:
     conn = _connect()
     cur = conn.cursor()
     cur.execute("""
-        SELECT * FROM help_answers
-        WHERE request_id = ?
-        ORDER BY COALESCE(created_at,'') ASC, answer_id ASC
-    """, (int(request_id),))
+        SELECT * FROM expert_applications
+        WHERE user_id=? AND status='pending'
+        ORDER BY application_id DESC
+        LIMIT 1
+    """, (int(user_id),))
+    row = cur.fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def create_expert_application(user_id: int, username: Optional[str], full_name: Optional[str], about_text: str) -> int:
+    # запрет: более одной pending
+    if get_pending_application(user_id):
+        return -1
+
+    conn = _connect()
+    cur = conn.cursor()
+
+    # --- Compatibility with stricter schemas ---
+    # Some DB versions require NOT NULL columns like topic/experience/motivation.
+    # We fill them from the collected about_text (3 answers) or fall back to about_text.
+    def _extract(label_keywords):
+        if not about_text:
+            return None
+        for line in str(about_text).splitlines():
+            low = line.strip().lower()
+            for kw in label_keywords:
+                if low.startswith(kw):
+                    # take text after ':' if present
+                    if ':' in line:
+                        return line.split(':', 1)[1].strip() or None
+        return None
+
+    motivation = _extract(["почему", "мотивац"]) or about_text
+    experience = _extract(["в чем", "компет", "опыт"]) or about_text
+    contact = _extract(["сколько", "врем", "недел"])  # optional
+    topic_value = "apply_expert"
+
+    cols = ["user_id"]
+    vals = [int(user_id)]
+
+    if _has_column(cur, "expert_applications", "username"):
+        cols.append("username")
+        vals.append((username or "").lstrip("@") if username else None)
+
+    if _has_column(cur, "expert_applications", "full_name"):
+        cols.append("full_name")
+        vals.append(full_name)
+
+    if _has_column(cur, "expert_applications", "about_text"):
+        cols.append("about_text")
+        vals.append(about_text)
+
+    # Required in some schemas
+    if _has_column(cur, "expert_applications", "topic"):
+        cols.append("topic")
+        vals.append(topic_value)
+
+    if _has_column(cur, "expert_applications", "experience"):
+        cols.append("experience")
+        vals.append(experience or "")
+
+    if _has_column(cur, "expert_applications", "motivation"):
+        cols.append("motivation")
+        vals.append(motivation or "")
+
+    if _has_column(cur, "expert_applications", "contact"):
+        cols.append("contact")
+        vals.append(contact)
+
+    # Status / timestamps
+    cols.append("status")
+    vals.append("pending")
+
+    cols.append("created_at")
+    vals.append(_now())
+
+    placeholders = ",".join(["?"] * len(cols))
+    col_sql = ", ".join(cols)
+
+    cur.execute(f"INSERT INTO expert_applications({col_sql}) VALUES ({placeholders})", tuple(vals))
+
+    conn.commit()
+    app_id = int(cur.lastrowid)
+    conn.close()
+    return app_id
+
+
+def list_pending_applications(limit: int = 50) -> List[Dict[str, Any]]:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT * FROM expert_applications
+        WHERE status='pending'
+        ORDER BY application_id ASC
+        LIMIT ?
+    """, (int(limit),))
     rows = cur.fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def set_application_status(application_id: int, status: str) -> bool:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute("UPDATE expert_applications SET status=? WHERE application_id=?", (status, int(application_id)))
+    ok = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    return ok
