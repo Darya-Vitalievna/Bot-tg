@@ -48,8 +48,7 @@ def register(dp: Dispatcher, bot):
     BTN_BACK_MAIN = getattr(kb, "BTN_BACK_MAIN", "⬅ В меню")
     BTN_ADMIN_EXPERTS = getattr(kb, "BTN_ADMIN_EXPERTS", None)
     BTN_ADMIN_DELETE_REQUEST = getattr(kb, "BTN_ADMIN_DELETE_REQUEST", "🗑 Удалить запрос")
-
-    GUILDS = getattr(kb, "GUILDS", ["Гильдия 1", "Гильдия 2", "Гильдия 3", "Гильдия 4", "Гильдия 5"])
+    GUILDS = ["Блоггинг", "Карьера", "Личная эффективность", "Спорт"]
     build_main_kb = getattr(kb, "build_main_kb", None)
 
     def guild_name(guild_id: int) -> str:
@@ -102,7 +101,7 @@ def register(dp: Dispatcher, bot):
     add_expert = getattr(db, "add_expert", None)
 
     # ----------------- HELP MENU -----------------
-    @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() == BTN_HELP)
+    @dp.message_handler(lambda m: m.chat.type == "private" and ("помощь эксперта" in ((m.text or "").strip().lower())))
     async def open_help_menu(message: types.Message):
         uid = message.from_user.id
         user_state[uid] = {}
@@ -140,7 +139,7 @@ def register(dp: Dispatcher, bot):
         for i, g in enumerate(GUILDS, start=1):
             ikb.add(InlineKeyboardButton(g, callback_data=f"hr_guild:{i}"))
 
-        await message.answer("Выбери гильдию:", reply_markup=ikb)
+        await message.answer("Выбери нишу:", reply_markup=ikb)
 
     @dp.callback_query_handler(lambda c: c.data and c.data.startswith("hr_guild:"))
     async def cb_choose_guild(call: types.CallbackQuery):
@@ -227,12 +226,18 @@ def register(dp: Dispatcher, bot):
 
         await message.answer(f"✅ Запрос отправлен. Номер: #{rid}", reply_markup=main_kb())
 
-        # ✅ notify ALL experts immediately
+        # ✅ notify experts only for this niche
         try:
-            if callable(list_experts):
+            experts = []
+            get_for_niche = getattr(db, "get_experts_for_niche", None)
+            if callable(get_for_niche):
+                experts = get_for_niche(guild_id) or []
+                # normalize to list of dicts with user_id
+                if experts and isinstance(experts[0], int):
+                    experts = [{"user_id": x} for x in experts]
+            elif callable(list_experts):
+                # fallback - if niche routing is unavailable, notify all experts
                 experts = list_experts() or []
-            else:
-                experts = []
 
             if experts:
                 ikb = InlineKeyboardMarkup()
@@ -244,11 +249,12 @@ def register(dp: Dispatcher, bot):
                     f"Суть: {essence[:80]}"
                 )
                 for e in experts:
-                    ex_id = int(e.get("user_id") or 0)
+                    ex_id = int(e.get("user_id") or 0) if isinstance(e, dict) else int(e or 0)
                     if ex_id:
                         await safe_notify(ex_id, text, reply_markup=ikb)
         except Exception:
             pass
+
 
     # ----------------- MY REQUESTS (student) -----------------
     @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() == BTN_MY_REQUESTS)
@@ -365,7 +371,22 @@ def register(dp: Dispatcher, bot):
             return
 
         try:
-            rows = list_open_requests(limit=10)
+            # фильтр по нишам эксперта (1-2 ниши)
+            niches = []
+            get_niches = getattr(db, "get_expert_niches", None)
+            if callable(get_niches):
+                try:
+                    niches = list(get_niches(uid) or [])
+                except Exception:
+                    niches = []
+
+            try:
+                # если db поддерживает параметр guild_ids
+                rows = list_open_requests(limit=10, guild_ids=niches) if niches else list_open_requests(limit=10)
+            except TypeError:
+                rows = list_open_requests(limit=10)
+                if niches:
+                    rows = [r for r in (rows or []) if int((r.get("guild_id") if isinstance(r, dict) else getattr(r, "guild_id", 0)) or 0) in set(niches)]
         except Exception:
             log.exception("list_open_requests failed")
             await message.answer("Не удалось загрузить запросы. Попробуй позже.", reply_markup=main_kb())
@@ -575,15 +596,12 @@ def register(dp: Dispatcher, bot):
                 reply_markup=main_kb()
             )
 
-    # ----------------- APPLY EXPERT (with inline approve/reject) -----------------
+    # ----------------- APPLY EXPERT (niches, max 2; with inline approve/reject) -----------------
     @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() == BTN_APPLY_EXPERT)
     async def apply_expert(message: types.Message):
         uid = message.from_user.id
 
-        if is_expert(uid):
-            await message.answer("Ты уже эксперт.", reply_markup=main_kb())
-            return
-
+        # pending check (for both new expert and adding 2nd niche)
         try:
             if callable(get_pending_application) and get_pending_application(uid):
                 await message.answer("Твоя заявка уже на рассмотрении. Дождись решения администратора.", reply_markup=main_kb())
@@ -591,10 +609,58 @@ def register(dp: Dispatcher, bot):
         except Exception:
             log.exception("get_pending_application failed")
 
+        # current niches (if expert already)
+        existing_niches = []
+        get_niches = getattr(db, "get_expert_niches", None)
+        if callable(get_niches):
+            try:
+                existing_niches = list(get_niches(uid) or [])
+            except Exception:
+                existing_niches = []
+
+        if is_expert(uid) and len(existing_niches) >= 2:
+            await message.answer("У тебя уже 2 ниши экспертности. Больше добавить нельзя.", reply_markup=main_kb())
+            return
+
+        # choose niche (exclude already owned niches)
+        available = [i for i in range(1, len(GUILDS) + 1) if (not is_expert(uid) or i not in existing_niches)]
+        if not available:
+            await message.answer("Нет доступных ниш для добавления.", reply_markup=main_kb())
+            return
+
         user_state.setdefault(uid, {})
-        user_state[uid]["apply"] = {"q1": None, "q2": None, "q3": None}
+        user_state[uid]["apply"] = {"niche_id": None, "q1": None, "q2": None, "q3": None}
+        set_step(uid, "apply_choose_niche")
+
+        ikb = InlineKeyboardMarkup(row_width=1)
+        for nid in available:
+            ikb.add(InlineKeyboardButton(guild_name(nid), callback_data=f"apply_niche:{nid}"))
+
+        if is_expert(uid):
+            await message.answer("Выбери нишу, в которой ты хочешь стать экспертом:", reply_markup=ikb)
+        else:
+            await message.answer("Выбери нишу, в которой ты хочешь стать экспертом:", reply_markup=ikb)
+
+    @dp.callback_query_handler(lambda c: c.data and c.data.startswith("apply_niche:"))
+    async def cb_apply_choose_niche(call: types.CallbackQuery):
+        uid = call.from_user.id
+        if get_step(uid) != "apply_choose_niche":
+            await call.answer()
+            return
+
+        try:
+            niche_id = int(call.data.split(":", 1)[1])
+        except Exception:
+            await call.answer("Ошибка", show_alert=True)
+            return
+
+        user_state.setdefault(uid, {})
+        user_state[uid].setdefault("apply", {})
+        user_state[uid]["apply"]["niche_id"] = niche_id
+
         set_step(uid, "apply_q1")
-        await message.answer("Почему ты хочешь стать экспертом?")
+        await call.message.answer("Почему ты хочешь стать экспертом?")
+        await call.answer()
 
     @dp.message_handler(lambda m: m.chat.type == "private" and get_step(m.from_user.id) in {"apply_q1", "apply_q2", "apply_q3"})
     async def apply_steps(message: types.Message):
@@ -604,23 +670,20 @@ def register(dp: Dispatcher, bot):
             await open_help_menu(message)
             return
 
-        if is_expert(uid):
-            user_state[uid] = {}
-            await message.answer("Ты уже эксперт.", reply_markup=main_kb())
-            return
-
         txt = (message.text or "").strip()
         if not txt:
             await message.answer("Напиши ответ текстом.")
             return
 
         apply = (user_state.get(uid) or {}).get("apply") or {}
+        niche_id = int(apply.get("niche_id") or 0)
+
         step = get_step(uid)
 
         if step == "apply_q1":
             apply["q1"] = txt
             set_step(uid, "apply_q2")
-            await message.answer("В чем твоя компетенция и опыт?")
+            await message.answer("Расскажи свой опыт и путь становления экспертом")
             return
 
         if step == "apply_q2":
@@ -633,8 +696,9 @@ def register(dp: Dispatcher, bot):
             apply["q3"] = txt
 
             about_text = (
+                f"Ниша: {guild_name(niche_id)}\n\n"
                 f"1) Почему хочу стать экспертом:\n{apply['q1']}\n\n"
-                f"2) Компетенция и опыт:\n{apply['q2']}\n\n"
+                f"2) Опыт и путь становления экспертом:\n{apply['q2']}\n\n"
                 f"3) Время в неделю:\n{apply['q3']}"
             )
 
@@ -644,7 +708,10 @@ def register(dp: Dispatcher, bot):
             app_id = None
             if callable(create_expert_application):
                 try:
-                    app_id = create_expert_application(uid, username, full_name, about_text)
+                    try:
+                        app_id = create_expert_application(uid, username, full_name, about_text, niche_id)
+                    except TypeError:
+                        app_id = create_expert_application(uid, username, full_name, about_text)
                 except Exception:
                     log.exception("create_expert_application failed")
                     user_state[uid] = {}
@@ -670,8 +737,8 @@ def register(dp: Dispatcher, bot):
 
             text = (
                 "🧑‍🏫 Новая заявка в эксперты\n"
-                f"{full_name or '(без имени)'}"
-                f"{(' @' + username) if username else ''}\n"
+                f"Ниша: {guild_name(niche_id)}\n"
+                f"{full_name or '(без имени)'}{(' @' + username) if username else ''}\n"
                 f"user_id: {uid}\n"
                 f"application_id: {app_id if app_id is not None else '(n/a)'}\n\n"
                 f"{about_text}"
@@ -683,6 +750,7 @@ def register(dp: Dispatcher, bot):
             await message.answer("✅ Заявка отправлена администраторам.", reply_markup=main_kb())
 
     @dp.callback_query_handler(lambda c: c.data and c.data.startswith("adm_app_accept:"))
+
     async def adm_app_accept(call: types.CallbackQuery):
         admin_id = call.from_user.id
         if not is_admin(admin_id):
@@ -697,11 +765,12 @@ def register(dp: Dispatcher, bot):
             # берём данные заявителя из expert_applications, чтобы корректно сохранить username/full_name в experts
             applicant_username = None
             applicant_full_name = None
+            applicant_niche_id = 0
             try:
                 conn = _db_connect_fallback()
                 cur = conn.cursor()
                 cur.execute("""
-                    SELECT username, full_name
+                    SELECT username, full_name, niche_id
                     FROM expert_applications
                     WHERE application_id=?
                     LIMIT 1
@@ -712,6 +781,10 @@ def register(dp: Dispatcher, bot):
                     try:
                         applicant_username = row[0]
                         applicant_full_name = row[1]
+                        try:
+                            applicant_niche_id = int(row[2] or 0)
+                        except Exception:
+                            applicant_niche_id = 0
                     except Exception:
                         pass
             except Exception:
@@ -721,6 +794,14 @@ def register(dp: Dispatcher, bot):
             if callable(add_expert):
                 add_expert(uid, admin_id, applicant_username, applicant_full_name)
 
+
+            # привязка эксперта к нише (максимум 2 ниши)
+            add_niche = getattr(db, "add_expert_niche", None)
+            if applicant_niche_id and callable(add_niche):
+                try:
+                    add_niche(uid, applicant_niche_id, added_by=admin_id)
+                except Exception:
+                    pass
             # статус заявки
             if callable(set_application_status) and app_id > 0:
                 set_application_status(app_id, "approved")
@@ -876,11 +957,28 @@ def register(dp: Dispatcher, bot):
             fname = None
 
         uname_part = f"@{uname}" if uname else None
+
+        # ниши эксперта (для админского списка)
+        niches = []
+        get_niches = getattr(db, "get_expert_niches", None)
+        if callable(get_niches):
+            try:
+                niches = list(get_niches(int(user_id)) or [])
+            except Exception:
+                niches = []
+        niche_suffix = ""
+        if niches:
+            try:
+                niche_suffix = " - " + ", ".join([guild_name(int(x)) for x in niches])
+            except Exception:
+                niche_suffix = ""
+
+        uname_part = f"@{uname}" if uname else None
         if fname and uname_part:
-            return f"{n}. {fname} ({uname_part}) [{user_id}]"
+            return f"{n}. {fname} ({uname_part}) [{user_id}]{niche_suffix}"
         if uname_part:
-            return f"{n}. {uname_part} [{user_id}]"
-        return f"{n}. [{user_id}]"
+            return f"{n}. {uname_part} [{user_id}]{niche_suffix}"
+        return f"{n}. [{user_id}]{niche_suffix}"
 
     @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() in {BTN_ADMIN_MENU, "⚙️ Управление экспертами", "👑 Управление экспертами"})
     async def admin_experts_menu(message: types.Message):

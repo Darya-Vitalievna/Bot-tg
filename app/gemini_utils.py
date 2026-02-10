@@ -1,10 +1,12 @@
 import re
-from typing import Tuple
+from typing import Tuple, Optional
 import google.genai as genai
 from google.genai import types as genai_types
 
 from .config import GEMINI_API_KEY, GEMINI_MODEL
 
+# Фолбэк-модель, которая была в старой рабочей версии бота
+FALLBACK_GEMINI_MODEL = "gemini-2.0-flash"
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 
@@ -21,12 +23,34 @@ def _extract_text_from_gemini_response(resp) -> str:
     return ""
 
 
-def gemini_text(prompt: str) -> str:
-    resp = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[prompt],
-    )
-    return _extract_text_from_gemini_response(resp)
+def gemini_text(prompt: str, model: Optional[str] = None) -> str:
+    """Текстовый запрос к Gemini.
+
+    model:
+      - None: сначала GEMINI_MODEL из config, при ошибке - FALLBACK_GEMINI_MODEL
+      - str: использовать конкретную модель (без фолбэка)
+    """
+    if model:
+        resp = gemini_client.models.generate_content(
+            model=model,
+            contents=[prompt],
+        )
+        return _extract_text_from_gemini_response(resp)
+
+    # 1) Пытаемся основной моделью из конфига
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[prompt],
+        )
+        return _extract_text_from_gemini_response(resp)
+    except Exception:
+        # 2) Если в конфиге указана недоступная/ошибочная модель - пробуем фолбэк
+        resp = gemini_client.models.generate_content(
+            model=FALLBACK_GEMINI_MODEL,
+            contents=[prompt],
+        )
+        return _extract_text_from_gemini_response(resp)
 
 
 def analyze_exercise_video(file_path: str) -> Tuple[str, str]:
@@ -59,10 +83,17 @@ def analyze_exercise_video(file_path: str) -> Tuple[str, str]:
         "Без объяснений, только две строки."
     )
 
-    resp = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[video_part, prompt_text],
-    )
+    # Для видео используем модель из конфига, а если она упадет - фолбэк
+    try:
+        resp = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[video_part, prompt_text],
+        )
+    except Exception:
+        resp = gemini_client.models.generate_content(
+            model=FALLBACK_GEMINI_MODEL,
+            contents=[video_part, prompt_text],
+        )
 
     text = _extract_text_from_gemini_response(resp).lower().strip()
 
