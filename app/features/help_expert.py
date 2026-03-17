@@ -1,5 +1,6 @@
 import logging
 import re
+from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 from aiogram import types
@@ -8,6 +9,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from .. import keyboards as kb
 from .. import db_help as db
+from .. import export_utils
 from ..storage import user_state
 
 log = logging.getLogger(__name__)
@@ -218,7 +220,16 @@ def register(dp: Dispatcher, bot):
             return
 
         try:
-            rid = create_help_request(uid, guild_id, essence, since, tried, result)
+            rid = create_help_request(
+                uid,
+                guild_id,
+                essence,
+                since,
+                tried,
+                result,
+                message.from_user.username,
+                message.from_user.full_name,
+            )
         except Exception:
             log.exception("create_help_request failed")
             await message.answer("Не удалось отправить запрос. Попробуй позже.", reply_markup=main_kb())
@@ -881,6 +892,8 @@ def register(dp: Dispatcher, bot):
         k.add(types.KeyboardButton(BTN_ADM_LIST))
         k.add(types.KeyboardButton(BTN_ADM_REMOVE))
         k.add(types.KeyboardButton(BTN_ADM_APPS))
+        k.add(types.KeyboardButton("📊 Выгрузка: книги и упражнения"))
+        k.add(types.KeyboardButton("📨 Выгрузка: запросы и ответы"))
         k.add(types.KeyboardButton(BTN_ADM_DELETE_REQUEST))
         k.add(types.KeyboardButton(BTN_ADM_BACK))
         return k
@@ -980,6 +993,57 @@ def register(dp: Dispatcher, bot):
             return f"{n}. {uname_part} [{user_id}]{niche_suffix}"
         return f"{n}. [{user_id}]{niche_suffix}"
 
+    async def _build_expert_export_rows(ids: List[int]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        get_niches = getattr(db, "get_expert_niches", None)
+
+        for number, user_id in enumerate(ids, start=1):
+            username = None
+            full_name = None
+            try:
+                chat = await bot.get_chat(int(user_id))
+                username = getattr(chat, "username", None)
+                full_name = getattr(chat, "full_name", None) or getattr(chat, "title", None)
+            except Exception:
+                pass
+
+            if not username or not full_name:
+                try:
+                    conn = _db_connect_fallback()
+                    cur = conn.cursor()
+                    cur.execute("SELECT username, full_name FROM experts WHERE user_id=? LIMIT 1", (int(user_id),))
+                    row = cur.fetchone()
+                    conn.close()
+                    if row:
+                        try:
+                            row = dict(row)
+                            username = username or row.get("username")
+                            full_name = full_name or row.get("full_name")
+                        except Exception:
+                            username = username or row[0]
+                            full_name = full_name or row[1]
+                except Exception:
+                    pass
+
+            niches = []
+            if callable(get_niches):
+                try:
+                    niches = list(get_niches(int(user_id)) or [])
+                except Exception:
+                    niches = []
+
+            rows.append(
+                {
+                    "number": number,
+                    "user_id": user_id,
+                    "username": username,
+                    "full_name": full_name,
+                    "guilds": ", ".join(guild_name(int(x)) for x in niches) if niches else "-",
+                }
+            )
+
+        return rows
+
     @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() in {BTN_ADMIN_MENU, "⚙️ Управление экспертами", "👑 Управление экспертами"})
     async def admin_experts_menu(message: types.Message):
         uid = message.from_user.id
@@ -989,6 +1053,58 @@ def register(dp: Dispatcher, bot):
         # полный сброс (как требование state.clear() по смыслу)
         user_state[uid] = {}
         await message.answer("⚙️ Управление экспертами:", reply_markup=admin_experts_kb())
+
+    async def _send_export_document(message: types.Message, builder, filename: str, caption: str):
+        uid = message.from_user.id
+        if not is_admin(uid):
+            await message.answer("⚠️ Нет доступа.", reply_markup=main_kb())
+            return False
+
+        export_path: Optional[Path] = None
+        try:
+            export_path = builder()
+            await bot.send_document(
+                uid,
+                types.InputFile(str(export_path), filename=filename),
+                caption=caption,
+            )
+            return True
+        except ImportError:
+            await message.answer(
+                "Не удалось собрать Excel-файл: не установлен пакет openpyxl.",
+                reply_markup=admin_experts_kb(),
+            )
+        except Exception:
+            log.exception("admin export failed: %s", filename)
+            await message.answer(
+                "Не удалось собрать выгрузку. Попробуй еще раз позже.",
+                reply_markup=admin_experts_kb(),
+            )
+            return False
+        finally:
+            if export_path:
+                try:
+                    export_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+    @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() == "📊 Выгрузка: книги и упражнения")
+    async def admin_export_books_exercises(message: types.Message):
+        await _send_export_document(
+            message,
+            export_utils.build_books_exercises_export,
+            "bookbot_books_exercises.xlsx",
+            "Выгрузка по книгам и упражнениям",
+        )
+
+    @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() == "📨 Выгрузка: запросы и ответы")
+    async def admin_export_help(message: types.Message):
+        await _send_export_document(
+            message,
+            export_utils.build_help_export,
+            "bookbot_help_requests_answers.xlsx",
+            "Выгрузка по запросам и ответам",
+        )
 
     @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() == BTN_ADM_BACK)
     async def admin_back_to_help(message: types.Message):
@@ -1036,12 +1152,37 @@ def register(dp: Dispatcher, bot):
         # сохраняем порядок (чтобы удаление по номеру было корректно)
         user_state.setdefault(uid, {})
         user_state[uid]["adm_expert_ids"] = ids
+        rows = await _build_expert_export_rows(ids)
 
-        lines = []
-        for i, ex_id in enumerate(ids, start=1):
-            lines.append(await _format_expert_line(i, ex_id))
-
-        await message.answer("📋 Список экспертов:\n" + "\n".join(lines), reply_markup=admin_experts_kb())
+        export_path: Optional[Path] = None
+        try:
+            export_path = export_utils.build_experts_export(rows)
+            await bot.send_document(
+                uid,
+                types.InputFile(str(export_path), filename="bookbot_experts.xlsx"),
+                caption="Список экспертов с нумерацией для удаления",
+            )
+            await message.answer(
+                "Нумерация в файле совпадает с удалением по номеру.",
+                reply_markup=admin_experts_kb(),
+            )
+        except ImportError:
+            await message.answer(
+                "Не удалось собрать Excel-файл: не установлен пакет openpyxl.",
+                reply_markup=admin_experts_kb(),
+            )
+        except Exception:
+            log.exception("admin experts export failed")
+            await message.answer(
+                "Не удалось собрать список экспертов. Попробуй еще раз позже.",
+                reply_markup=admin_experts_kb(),
+            )
+        finally:
+            if export_path:
+                try:
+                    export_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     @dp.message_handler(lambda m: m.chat.type == "private" and (m.text or "").strip() == BTN_ADM_REMOVE)
     async def admin_remove_expert_start(message: types.Message):

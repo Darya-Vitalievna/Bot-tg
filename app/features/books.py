@@ -1,28 +1,65 @@
 import logging
+import re
 from typing import List
+
 from aiogram import Dispatcher, types
 
+from .. import db_help
 from ..gemini_utils import gemini_text
 from ..keyboards import BTN_BOOK, build_main_kb
 from ..storage import user_state
 
 
+def _normalize_question_line(line: str) -> str:
+    line = line.strip()
+    line = re.sub(r"^\s*[-*•]\s*", "", line)
+    line = re.sub(r"^\s*\d+[.)]\s*", "", line)
+    return line.strip(" \"'")
+
+
+def _extract_questions(text: str) -> List[str]:
+    questions: List[str] = []
+    for raw_line in text.splitlines():
+        line = _normalize_question_line(raw_line)
+        if not line:
+            continue
+        if "вопрос" in line.lower() and ":" in line:
+            line = line.split(":", 1)[1].strip()
+        if "?" not in line:
+            continue
+        if line not in questions:
+            questions.append(line)
+        if len(questions) == 3:
+            return questions
+    return questions
+
+
 def generate_questions_for_book(book_name: str) -> List[str]:
-    prompt = f"""Сгенерируй 3 простых, но важных вопросов по содержанию книги "{book_name}".
+    prompt = (
+        f'Сгенерируй 3 простых, но важных вопроса по содержанию книги "{book_name}".\n\n'
+        "Требования к вопросам:\n"
+        "- вопросы должны быть по ключевым моментам сюжета, а не по мелким деталям\n"
+        "- один вопрос должен отражать начало книги, один середину, один ближе к финалу\n"
+        "- вопросы должны быть короткими, понятными и проверять факт чтения\n"
+        "- не спрашивай даты, имена второстепенных персонажей, номера глав и цитаты\n"
+        "- избегай философских и аналитических вопросов, только фактические события\n\n"
+        "Верни только 3 вопроса, каждый на новой строке, без нумерации и без пояснений."
+    )
 
-Требования к вопросам:
-- вопросы должны быть по ключевым моментам сюжета (не по мелким деталям)
-- один вопрос должен отражать начало книги, один - середину, один - ближе к финалу
-- вопросы должны быть короткими, понятными и направленными на проверку факта чтения
-- не спрашивай даты, имена второстепенных персонажей, номера глав, цитаты
-- избегай философских и аналитических вопросов - только фактические события
-
-Выведи только 3 строки - 3 вопроса, без нумерации и без лишнего текста.
-"""
     text = gemini_text(prompt)
-    lines = [line.strip() for line in text.split("\n") if line.strip()]
-    if len(lines) >= 3:
-        return lines[:3]
+    questions = _extract_questions(text)
+    if len(questions) >= 3:
+        return questions[:3]
+
+    retry_text = gemini_text(
+        prompt
+        + "\n\n"
+        + "Верни ровно три коротких вопроса. Каждый вопрос должен заканчиваться знаком вопроса. Без заголовков и лишнего текста."
+    )
+    questions = _extract_questions(retry_text)
+    if len(questions) >= 3:
+        return questions[:3]
+
     raise ValueError("Не удалось сгенерировать 3 корректных вопроса по книге")
 
 
@@ -95,7 +132,6 @@ def register(dp: Dispatcher) -> None:
         user_state[user_id] = {"step": "waiting_book"}
         await message.answer("Введи название книги.")
 
-    # ✅ ВАЖНО: этот хендлер теперь матчится ТОЛЬКО когда у пользователя шаг книги
     @dp.message_handler(
         lambda m: _books_step(m.from_user.id) in ("waiting_book", "asking_questions"),
         content_types=["text"],
@@ -158,6 +194,14 @@ def register(dp: Dispatcher) -> None:
                 user_state[user_id] = None
                 return
 
+            db_help.save_book_record(
+                user_id=user_id,
+                book_name=book_name,
+                questions=questions,
+                answers=answers,
+                result_text=result_text,
+                username=message.from_user.username,
+                full_name=message.from_user.full_name,
+            )
             await message.answer(result_text, reply_markup=build_main_kb())
             user_state[user_id] = None
-            return

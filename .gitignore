@@ -5,6 +5,8 @@ venv/
 app/features/venv/
 
 *.sqlite3
+*.xlsx
+.env
 
 .vscode/
 .idea/

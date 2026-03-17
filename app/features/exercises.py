@@ -1,16 +1,17 @@
-import logging
-import re
-import os
 import datetime
-import requests
+import logging
+import os
+import re
 from collections import defaultdict
-from typing import Dict, Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
+import requests
 from aiogram import Dispatcher, types
 
-from ..keyboards import BTN_EXERCISE, BTN_STATS, build_main_kb
-from ..storage import user_state, exercise_log
+from .. import db_help
 from ..gemini_utils import analyze_exercise_video
+from ..keyboards import BTN_EXERCISE, BTN_STATS, build_main_kb
+from ..storage import exercise_log, user_state
 
 
 def parse_exercise(text: str) -> Tuple[str, int, str] | None:
@@ -72,25 +73,39 @@ def save_exercise(user_id: int, name: str, amount: int, unit: str) -> None:
 
 
 def format_exercise_stats(user_id: int) -> str:
-    if user_id not in exercise_log or not exercise_log[user_id]:
-        return "Пока нет ни одной записи с упражнениями."
+    records = db_help.list_exercise_records(user_id)
+    book_records = db_help.list_book_records(user_id, limit=1000)
 
-    user_days = exercise_log[user_id]
-    today_str = datetime.date.today().isoformat()
+    today = datetime.date.today()
+    today_str = today.isoformat()
+    month_key = today.strftime("%Y-%m")
+    month_label = today.strftime("%m.%Y")
+
+    month_records = [rec for rec in records if str(rec.get("created_at") or "").startswith(month_key)]
+    month_book_records = [rec for rec in book_records if str(rec.get("created_at") or "").startswith(month_key)]
+
+    if not month_records and not month_book_records:
+        return f"Статистика за {month_label}\n\nПока нет записей за текущий месяц."
 
     today_totals = defaultdict(int)
-    for rec in user_days.get(today_str, []):
-        key = (rec["name"], rec["unit"])
-        today_totals[key] += rec["amount"]
+    month_totals = defaultdict(int)
+    recent_lines: List[str] = []
 
-    total_totals = defaultdict(int)
-    for _, recs in user_days.items():
-        for rec in recs:
-            key = (rec["name"], rec["unit"])
-            total_totals[key] += rec["amount"]
+    for index, rec in enumerate(month_records):
+        created_at = str(rec.get("created_at") or "")
+        created_day = created_at[:10]
+        key = (str(rec.get("exercise_name") or ""), str(rec.get("unit") or ""))
+        amount = int(rec.get("amount") or 0)
+        month_totals[key] += amount
+        if created_day == today_str:
+            today_totals[key] += amount
+        if index < 5:
+            recent_lines.append(
+                f"- {created_at[:16].replace('T', ' ')}: {rec['exercise_name']} - {rec['amount']} {rec['unit']}"
+            )
 
-    lines: List[str] = []
-    lines.append(f"Сегодня ({today_str}):")
+    lines: List[str] = [f"Статистика за {month_label}", ""]
+    lines.append("Упражнения сегодня:")
     if today_totals:
         for (name, unit), amount in today_totals.items():
             lines.append(f"- {name} - {amount} {unit}")
@@ -98,9 +113,28 @@ def format_exercise_stats(user_id: int) -> str:
         lines.append("- пока нет упражнений за сегодня")
 
     lines.append("")
-    lines.append("Всего за всё время:")
-    for (name, unit), amount in total_totals.items():
-        lines.append(f"- {name} - {amount} {unit}")
+    lines.append("Упражнения за текущий месяц:")
+    if month_totals:
+        for (name, unit), amount in month_totals.items():
+            lines.append(f"- {name} - {amount} {unit}")
+    else:
+        lines.append("- пока нет записей за текущий месяц")
+
+    lines.append("")
+    lines.append("Последние упражнения:")
+    if recent_lines:
+        lines.extend(recent_lines)
+    else:
+        lines.append("- пока нет упражнений за текущий месяц")
+
+    lines.append("")
+    lines.append("Книги за текущий месяц:")
+    if month_book_records:
+        for rec in month_book_records[:5]:
+            created_at = str(rec.get("created_at") or "")[:16].replace("T", " ")
+            lines.append(f"- {created_at}: {rec['book_name']}")
+    else:
+        lines.append("- пока нет книг за текущий месяц")
 
     return "\n".join(lines)
 
@@ -144,7 +178,10 @@ def register(dp: Dispatcher, bot_token: str, bot) -> None:
         unit = state.get("exercise_unit")
 
         if not (name and amount and unit):
-            await message.answer("Что-то пошло не так. Нажми Сделал упражнение и начни заново.", reply_markup=build_main_kb())
+            await message.answer(
+                "Что-то пошло не так. Нажми Сделал упражнение и начни заново.",
+                reply_markup=build_main_kb(),
+            )
             user_state[user_id] = None
             return
 
@@ -174,7 +211,10 @@ def register(dp: Dispatcher, bot_token: str, bot) -> None:
                 f.write(r.content)
         except Exception as e:
             logging.exception("Ошибка при скачивании видео из Telegram: %s", e)
-            await message.answer("Не удалось скачать видео. Попробуй отправить ещё раз.", reply_markup=build_main_kb())
+            await message.answer(
+                "Не удалось скачать видео. Попробуй отправить ещё раз.",
+                reply_markup=build_main_kb(),
+            )
             user_state[user_id] = None
             return
 
@@ -194,7 +234,10 @@ def register(dp: Dispatcher, bot_token: str, bot) -> None:
             expected = normalize_user_exercise_type(name)
 
             if label != "exercise":
-                await message.answer("По видео не видно упражнения. Сними так, чтобы было видно всё тело.", reply_markup=build_main_kb())
+                await message.answer(
+                    "По видео не видно упражнения. Сними так, чтобы было видно всё тело.",
+                    reply_markup=build_main_kb(),
+                )
                 user_state[user_id] = None
             elif expected != "unknown" and ex_type != expected:
                 await message.answer(
@@ -206,6 +249,15 @@ def register(dp: Dispatcher, bot_token: str, bot) -> None:
                 user_state[user_id] = None
             else:
                 save_exercise(user_id, name, amount, unit)
+                db_help.save_exercise_record(
+                    user_id=user_id,
+                    exercise_name=name,
+                    amount=amount,
+                    unit=unit,
+                    video_file_id=file_id,
+                    username=message.from_user.username,
+                    full_name=message.from_user.full_name,
+                )
                 await message.answer(f"Записал: {name} - {amount} {unit}", reply_markup=build_main_kb())
                 user_state[user_id] = None
         finally:
@@ -214,7 +266,6 @@ def register(dp: Dispatcher, bot_token: str, bot) -> None:
             except OSError:
                 pass
 
-    # ✅ ВАЖНО: текстовый роутер упражнений матчится ТОЛЬКО на шаге waiting_exercise_text
     @dp.message_handler(
         lambda m: _ex_step(m.from_user.id) == "waiting_exercise_text",
         content_types=["text"],

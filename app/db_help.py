@@ -27,6 +27,10 @@ def _now() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
 
 
+def current_month_key() -> str:
+    return datetime.datetime.now().strftime("%Y-%m")
+
+
 def _table_exists(cur: sqlite3.Cursor, name: str) -> bool:
     cur.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (name,))
     return cur.fetchone() is not None
@@ -41,6 +45,13 @@ def _has_column(cur: sqlite3.Cursor, table: str, col: str) -> bool:
 def _add_column(cur: sqlite3.Cursor, table: str, col: str, ddl: str) -> None:
     if not _has_column(cur, table, col):
         cur.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}")
+
+
+def _clean_username(username: Optional[str]) -> Optional[str]:
+    if not username:
+        return None
+    value = str(username).strip().lstrip("@")
+    return value or None
 
 
 # ----------------- roles -----------------
@@ -71,6 +82,15 @@ def validate_expert_part(user_id: int, guild_id: int) -> bool:
 def init_help_db() -> None:
     conn = _connect()
     cur = conn.cursor()
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS telegram_users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        last_seen_at TEXT
+    )
+    """)
 
     # experts
     cur.execute("""
@@ -132,6 +152,32 @@ def init_help_db() -> None:
     _add_column(cur, "help_answers", "expert_username", "TEXT")
     _add_column(cur, "help_answers", "expert_full_name", "TEXT")
 
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS exercise_records (
+        exercise_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        exercise_name TEXT NOT NULL,
+        amount INTEGER NOT NULL,
+        unit TEXT NOT NULL,
+        ai_status TEXT NOT NULL DEFAULT 'Принято',
+        video_file_id TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+    _add_column(cur, "exercise_records", "ai_status", "TEXT NOT NULL DEFAULT 'Принято'")
+
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS book_records (
+        book_id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER NOT NULL,
+        book_name TEXT NOT NULL,
+        questions_text TEXT,
+        answers_text TEXT,
+        result_text TEXT,
+        created_at TEXT NOT NULL
+    )
+    """)
+
     # expert_applications
     cur.execute("""
     CREATE TABLE IF NOT EXISTS expert_applications (
@@ -153,6 +199,12 @@ def init_help_db() -> None:
     try:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_answers_req ON help_answers(request_id)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_answers_expert ON help_answers(expert_user_id)")
+    except Exception:
+        pass
+    try:
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_tg_users_username ON telegram_users(username)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_exercise_records_user_created ON exercise_records(user_id, created_at)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_book_records_user_created ON book_records(user_id, created_at)")
     except Exception:
         pass
     try:
@@ -242,7 +294,259 @@ def list_experts(guild_id: Optional[int] = None) -> List[Dict[str, Any]]:
         cur.execute("SELECT user_id, added_at, added_by FROM experts ORDER BY user_id ASC")
     rows = cur.fetchall()
     conn.close()
-    return [dict(r) for r in rows] if not guild_ids else [dict(r) for r in rows if int((r["guild_id"] if isinstance(r, sqlite3.Row) else r.get("guild_id", 0)) or 0) in set(int(x) for x in (guild_ids or []))]
+    return [dict(r) for r in rows]
+
+
+def upsert_telegram_user(user_id: int, username: Optional[str], full_name: Optional[str]) -> None:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO telegram_users(user_id, username, full_name, last_seen_at)
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            username=excluded.username,
+            full_name=excluded.full_name,
+            last_seen_at=excluded.last_seen_at
+        """,
+        (int(user_id), _clean_username(username), full_name, _now()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def save_exercise_record(
+    user_id: int,
+    exercise_name: str,
+    amount: int,
+    unit: str,
+    ai_status: str = "Принято",
+    video_file_id: Optional[str] = None,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None,
+) -> int:
+    upsert_telegram_user(user_id, username, full_name)
+
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO exercise_records(user_id, exercise_name, amount, unit, ai_status, video_file_id, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (int(user_id), exercise_name, int(amount), unit, ai_status, video_file_id, _now()),
+    )
+    conn.commit()
+    exercise_id = int(cur.lastrowid)
+    conn.close()
+    return exercise_id
+
+
+def list_exercise_records(user_id: int, limit: int = 1000) -> List[Dict[str, Any]]:
+    conn = _connect()
+    cur = conn.cursor()
+    ai_status_sql = "ai_status" if _has_column(cur, "exercise_records", "ai_status") else "'Принято' AS ai_status"
+    cur.execute(
+        f"""
+        SELECT exercise_id, user_id, exercise_name, amount, unit, {ai_status_sql}, video_file_id, created_at
+        FROM exercise_records
+        WHERE user_id=?
+        ORDER BY created_at DESC, exercise_id DESC
+        LIMIT ?
+        """,
+        (int(user_id), int(limit)),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def save_book_record(
+    user_id: int,
+    book_name: str,
+    questions: List[str],
+    answers: List[str],
+    result_text: str,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None,
+) -> int:
+    upsert_telegram_user(user_id, username, full_name)
+
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO book_records(user_id, book_name, questions_text, answers_text, result_text, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            int(user_id),
+            book_name,
+            "\n".join(questions),
+            "\n".join(answers),
+            result_text,
+            _now(),
+        ),
+    )
+    conn.commit()
+    book_id = int(cur.lastrowid)
+    conn.close()
+    return book_id
+
+
+def list_book_records(user_id: int, limit: int = 1000) -> List[Dict[str, Any]]:
+    conn = _connect()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT book_id, user_id, book_name, questions_text, answers_text, result_text, created_at
+        FROM book_records
+        WHERE user_id=?
+        ORDER BY created_at DESC, book_id DESC
+        LIMIT ?
+        """,
+        (int(user_id), int(limit)),
+    )
+    rows = cur.fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def export_books_and_exercises_rows(month_key: Optional[str] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    conn = _connect()
+    cur = conn.cursor()
+    ai_status_sql = "e.ai_status" if _has_column(cur, "exercise_records", "ai_status") else "'Принято' AS ai_status"
+
+    exercise_where = ""
+    exercise_params: List[Any] = []
+    book_where = ""
+    book_params: List[Any] = []
+    if month_key:
+        exercise_where = "WHERE substr(e.created_at, 1, 7) = ?"
+        exercise_params.append(month_key)
+        book_where = "WHERE substr(b.created_at, 1, 7) = ?"
+        book_params.append(month_key)
+
+    cur.execute(
+        f"""
+        SELECT
+            e.exercise_id,
+            e.created_at,
+            e.user_id,
+            u.username,
+            u.full_name,
+            e.exercise_name,
+            e.amount,
+            e.unit,
+            {ai_status_sql},
+            e.video_file_id
+        FROM exercise_records e
+        LEFT JOIN telegram_users u ON u.user_id = e.user_id
+        {exercise_where}
+        ORDER BY e.created_at DESC, e.exercise_id DESC
+        """,
+        exercise_params,
+    )
+    exercise_rows = [dict(r) for r in cur.fetchall()]
+
+    cur.execute(
+        f"""
+        SELECT
+            b.book_id,
+            b.created_at,
+            b.user_id,
+            u.username,
+            u.full_name,
+            b.book_name,
+            b.result_text,
+            b.questions_text,
+            b.answers_text
+        FROM book_records b
+        LEFT JOIN telegram_users u ON u.user_id = b.user_id
+        {book_where}
+        ORDER BY b.created_at DESC, b.book_id DESC
+        """,
+        book_params,
+    )
+    book_rows = [dict(r) for r in cur.fetchall()]
+
+    conn.close()
+    return exercise_rows, book_rows
+
+
+def export_help_requests_and_answers_rows(month_key: Optional[str] = None) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    conn = _connect()
+    cur = conn.cursor()
+
+    request_where = ""
+    request_params: List[Any] = []
+    answer_where = ""
+    answer_params: List[Any] = []
+    if month_key:
+        request_where = "WHERE substr(r.created_at, 1, 7) = ?"
+        request_params.append(month_key)
+        answer_where = "WHERE substr(a.created_at, 1, 7) = ?"
+        answer_params.append(month_key)
+
+    cur.execute(
+        f"""
+        SELECT
+            r.request_id,
+            r.created_at,
+            r.guild_id,
+            r.student_user_id,
+            su.username AS student_username,
+            su.full_name AS student_full_name,
+            r.problem_essence,
+            r.problem_since,
+            r.tried_actions,
+            r.desired_result,
+            r.status,
+            r.is_closed,
+            r.is_deleted,
+            (
+                SELECT COUNT(*)
+                FROM help_answers a
+                WHERE a.request_id = r.request_id
+            ) AS answers_count
+        FROM help_requests r
+        LEFT JOIN telegram_users su ON su.user_id = r.student_user_id
+        {request_where}
+        ORDER BY r.created_at DESC, r.request_id DESC
+        """,
+        request_params,
+    )
+    request_rows = [dict(r) for r in cur.fetchall()]
+
+    cur.execute(
+        f"""
+        SELECT
+            a.answer_id,
+            a.created_at,
+            a.request_id,
+            r.guild_id,
+            r.student_user_id,
+            su.username AS student_username,
+            su.full_name AS student_full_name,
+            r.problem_essence,
+            r.desired_result,
+            a.expert_user_id,
+            COALESCE(a.expert_username, e.username) AS expert_username,
+            COALESCE(a.expert_full_name, e.full_name) AS expert_full_name,
+            a.answer_text
+        FROM help_answers a
+        LEFT JOIN help_requests r ON r.request_id = a.request_id
+        LEFT JOIN telegram_users su ON su.user_id = r.student_user_id
+        LEFT JOIN experts e ON e.user_id = a.expert_user_id
+        {answer_where}
+        ORDER BY a.created_at DESC, a.answer_id DESC
+        """,
+        answer_params,
+    )
+    answer_rows = [dict(r) for r in cur.fetchall()]
+
+    conn.close()
+    return request_rows, answer_rows
 
 
 
@@ -305,7 +609,18 @@ def get_experts_for_niche(niche_id: int) -> List[int]:
 
 # ----------------- requests -----------------
 
-def create_help_request(user_id: int, guild_id: int, essence: str, since: str, tried: str, result: str) -> int:
+def create_help_request(
+    user_id: int,
+    guild_id: int,
+    essence: str,
+    since: str,
+    tried: str,
+    result: str,
+    username: Optional[str] = None,
+    full_name: Optional[str] = None,
+) -> int:
+    upsert_telegram_user(user_id, username, full_name)
+
     conn = _connect()
     cur = conn.cursor()
 
@@ -498,6 +813,8 @@ def try_save_answer(expert_user_id: int, request_id: int, answer_text: str,
                     expert_username: Optional[str] = None, expert_full_name: Optional[str] = None) -> bool:
     if is_request_closed(request_id):
         return False
+
+    upsert_telegram_user(expert_user_id, expert_username, expert_full_name)
 
     conn = _connect()
     cur = conn.cursor()
